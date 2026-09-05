@@ -1,10 +1,12 @@
+import csv
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-
+from torch.utils.data import DataLoader, random_split
 from model import MLP
 
 
@@ -18,17 +20,25 @@ PRUNE_PER_ROUND = 0.20
 # Hány pruning + retraining kör legyen
 NUM_ROUNDS = 30
 
+SEED = 42
+
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
 print("Device:", device)
 
+
 transform = transforms.Compose([
     transforms.ToTensor()
 ])
 
-train_dataset = datasets.MNIST(
+full_train_dataset = datasets.MNIST(
     root="./data",
     train=True,
     download=True,
@@ -42,10 +52,22 @@ test_dataset = datasets.MNIST(
     transform=transform
 )
 
+train_dataset, validation_dataset = random_split(
+    full_train_dataset,
+    [55000, 5000],
+    generator=torch.Generator().manual_seed(SEED)
+)
+
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
     shuffle=True
+)
+
+validation_loader = DataLoader(
+    validation_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False
 )
 
 test_loader = DataLoader(
@@ -54,7 +76,8 @@ test_loader = DataLoader(
     shuffle=False
 )
 
-def evaluate(model):
+
+def evaluate(model, loader):
     model.eval()
 
     correct = 0
@@ -62,7 +85,7 @@ def evaluate(model):
 
     with torch.no_grad():
 
-        for images, labels in test_loader:
+        for images, labels in loader:
 
             images = images.to(device)
             labels = labels.to(device)
@@ -81,6 +104,7 @@ def evaluate(model):
 
     return accuracy
 
+
 def create_initial_masks(model):
 
     masks = {}
@@ -95,6 +119,7 @@ def create_initial_masks(model):
             )
 
     return masks
+
 
 def prune_smallest_weights(model, masks, pruning_ratio):
 
@@ -136,6 +161,7 @@ def prune_smallest_weights(model, masks, pruning_ratio):
 
     return threshold.item()
 
+
 def reset_to_initial_weights(
     model,
     initial_state,
@@ -166,6 +192,8 @@ def train_sparse_model(model, masks):
         model.parameters(),
         lr=LEARNING_RATE
     )
+
+    validation_accuracy = 0.0
 
     for epoch in range(EPOCHS):
 
@@ -231,13 +259,19 @@ def train_sparse_model(model, masks):
             100 * correct / total
         )
 
-        test_accuracy = evaluate(model)
+        validation_accuracy = evaluate(
+            model,
+            validation_loader
+        )
 
         print(
             f"Epoch {epoch + 1}/{EPOCHS} | "
             f"Train: {train_accuracy:.2f}% | "
-            f"Test: {test_accuracy:.2f}%"
+            f"Validation: {validation_accuracy:.2f}%"
         )
+
+    return validation_accuracy
+
 
 def count_weights(masks):
 
@@ -273,23 +307,25 @@ def count_weights(masks):
 def main():
 
     initial_state = torch.load(
-    "results/initial_mlp_mnist.pth",
-    map_location=device
+        "results/initial_mlp_mnist.pth",
+        map_location=device
     )
-
 
     model = MLP().to(device)
 
     model.load_state_dict(
-    torch.load(
-        "results/baseline_mlp_mnist.pth",
-        map_location=device
+        torch.load(
+            "results/baseline_mlp_mnist.pth",
+            map_location=device
         )
     )
 
     masks = create_initial_masks(model)
 
-    baseline_accuracy = evaluate(model)
+    baseline_accuracy = evaluate(
+        model,
+        test_loader
+    )
 
     print("\n--------------------------------")
     print("BASELINE")
@@ -308,6 +344,35 @@ def main():
     print(f"Nulla súly: {zero}")
     print(f"Sparsity: {sparsity:.2f}%")
 
+    csv_path = "results/imp_results.csv"
+
+    with open(
+        csv_path,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as csv_file:
+
+        writer = csv.writer(csv_file)
+
+        writer.writerow([
+            "round",
+            "sparsity",
+            "active_weights",
+            "zero_weights",
+            "validation_accuracy",
+            "test_accuracy"
+        ])
+
+        writer.writerow([
+            0,
+            sparsity,
+            active,
+            zero,
+            "",
+            baseline_accuracy
+        ])
+
     for round_number in range(
         1,
         NUM_ROUNDS + 1
@@ -318,8 +383,6 @@ def main():
         print("================================")
 
         # Pruning a jelenleg betanított modellből
-        
-
         threshold = prune_smallest_weights(
             model,
             masks,
@@ -345,7 +408,6 @@ def main():
         )
 
         # Reset az eredeti random inicializációra
-
         reset_to_initial_weights(
             model,
             initial_state,
@@ -353,15 +415,17 @@ def main():
         )
 
         # Sparse háló újratanítása
-
         print("\nÚjratanítás...")
 
-        train_sparse_model(
+        validation_accuracy = train_sparse_model(
             model,
             masks
         )
 
-        accuracy = evaluate(model)
+        test_accuracy = evaluate(
+            model,
+            test_loader
+        )
 
         total, zero, active, sparsity = (
             count_weights(masks)
@@ -382,20 +446,45 @@ def main():
         )
 
         print(
+            f"Validation accuracy: "
+            f"{validation_accuracy:.2f}%"
+        )
+
+        print(
             f"Test accuracy: "
-            f"{accuracy:.2f}%"
+            f"{test_accuracy:.2f}%"
         )
 
         torch.save({
-        "model_state_dict": model.state_dict(),
-        "masks": masks,
-        "sparsity": sparsity,
-        "accuracy": accuracy
+            "model_state_dict": model.state_dict(),
+            "masks": masks,
+            "sparsity": sparsity,
+            "accuracy": test_accuracy,
+            "validation_accuracy": validation_accuracy
         }, f"results/imp_round_{round_number}.pth")
 
         print(
-        f"Modell elmentve: results/imp_round_{round_number}.pth"
+            f"Modell elmentve: "
+            f"results/imp_round_{round_number}.pth"
         )
+
+        with open(
+            csv_path,
+            "a",
+            newline="",
+            encoding="utf-8"
+        ) as csv_file:
+
+            writer = csv.writer(csv_file)
+
+            writer.writerow([
+                round_number,
+                sparsity,
+                active,
+                zero,
+                validation_accuracy,
+                test_accuracy
+            ])
 
 
 if __name__ == "__main__":
